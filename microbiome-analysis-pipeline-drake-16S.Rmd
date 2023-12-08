@@ -1,0 +1,689 @@
+---
+title: "metagenome-analysis-pipeline-drake"
+author: "Emily Wissel"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## specify path to Rtools, must download from https://cran.r-project.org/bin/windows/Rtools/rtools40.html
+## default windows path. will be diff for mac 
+## note that my path is different from what is provided in the tutorial
+#write('PATH="${RTOOLS40_HOME}\\c;${PATH}"', file = "~/.Renviron", append = TRUE)
+#install.packages("Rtools")
+#if (!require("BiocManager", quietly = TRUE))
+#    install.packages("BiocManager")
+
+#aBiocManager::install("BiocParallel")
+
+#install.packages("LDM_6.0.tar.gz", repos=NULL) ## download LDM from github directly if you have issues. note that you need r version 4.0 or older
+
+
+```
+
+## R Markdown
+
+This document is compiled by Dr. Emily Wissel for Dr. Erika Diaz-Almeyda for the purpose of analyzing processed microbiome data. This document expects a metadata table and a taxa table with taxa as rows and samples as columns as inputs. 
+This document also integrates code written by Shannon Collins in the script FHI-combo-data-microbiome-analysis.Rmd. 
+
+rtools link: https://clanfear.github.io/CSSS508/docs/compiling.html 
+
+```{r load libraries}
+## from shannon's script
+library(ape)
+library(lme4)
+#library(plotly)
+library(tidyverse) # If you load tidyverse, that includes dplyr, plyr, ggplot2, stringr, and more
+library(VennDiagram)
+library(readxl)
+library(reshape2)
+library(RColorBrewer)
+library(data.table)
+library(RColorBrewer)
+library(ggdendro)
+#library(DESeq2)
+library(vegan)
+
+### for my analysis piece 
+#install.packages("pacman")
+#pacman::p_load("reshape2", "GUniFrac","LDM")
+library("janitor")
+library("LDM")
+#library(devtools)
+#install.packages("LDM")
+#install_phyloseq()
+#### note that phyloseq is no longer maintained so im going to try and do this without phyloseq
+sessionInfo()
+
+## rtools troubleshooting
+#install.packages(path_to_file, repos = NULL, type="source")
+```
+
+Next, we want to load the data into this R space. I'm going to use csvs as the input files, so keep this in mind! I'll try and add every file here at the top in this code chunk so you don't have to scroll through the file and change things for it to run. Make sure you inspect the table output from `head(data)` so that you know the dataframe looks as you expect. Sometimes there are extra header rows or other issues that can lead to issues later in the analysis pipeline. 
+
+** Note that you will need the file path to the data for the `read_csv` to work. You will also need to save this Rmd file so you can direct the path to the data file. The simplest approach is to save them in the same folder. 
+
+
+```{r read in data}
+## this file path is assuming that this script and the data are saved in the same folder.
+meta_dat <- read_csv("metadata-drake-test.csv")
+meta_dat$plant_type <- as.factor(meta_dat$Sample.ID.2)
+meta_dat$farm_type <- as.factor(meta_dat$Sample.ID.3)
+## for standard zymo output 
+micro_dat <- read_csv("otu_table_16S_drake-test.csv")
+#str(micro_dat) ## make sure species counts are "num", which they are in this case by default
+#micro_dat <- micro_dat %>% select(-...32)
+## fix dup columns
+micro_dat$taxonomy <- as.factor(micro_dat$taxonomy)
+## mr dna 
+micro_dat <- micro_dat %>% 
+  separate(taxonomy, c("kingdom","phylum", "class", "order", "family", "genus", "species"), sep = "; ") %>%
+  #FOR SPECIES
+  #select(-kingdom, - phylum, - class, -order, -family, -genus, -`#OTU ID`) %>%
+  #drop_na(species)
+
+#FOR GENUS
+  #select(-kingdom, - phylum, - class, -order, -family, -species, -`#OTU ID`) %>%
+  #drop_na(genus)
+        #micro_dat$genus <- gsub(" g__","",micro_dat$genus)    
+        #micro_dat$genus <-gsub("g__","",micro_dat$genus)
+        #micro_dat$genus <- tools::toTitleCase(micro_dat$genus)
+
+#FOR PHYLA
+  select(-kingdom, - class, -order, -family, -genus, -species, -`#OTU ID`) %>%
+  drop_na(phylum)
+
+        micro_dat$phylum <- gsub(" p__","",micro_dat$phylum)    
+        micro_dat$phylum <-gsub("p__","",micro_dat$phylum)
+        micro_dat$phylum <- tools::toTitleCase(micro_dat$phylum)
+        
+#FOR FAMILY
+  #select(-kingdom, - phylum, - class, -order, -genus, -species, -`#OTU ID`) %>%
+  #drop_na(family)
+
+        #micro_dat$family <- gsub(" f__","",micro_dat$family)    
+        #micro_dat$family <-gsub("f__","",micro_dat$family)
+        #micro_dat$family <- tools::toTitleCase(micro_dat$family)
+        
+microdat1 <- micro_dat %>%
+#FOR SPECIES
+  #pivot_longer(cols = -species,names_to="Sample",values_to="count") %>%
+  #group_by(species, Sample) %>% 
+#FOR GENUS
+  #pivot_longer(cols = -genus,names_to="Sample",values_to="count") %>%
+  #group_by(genus, Sample) %>% 
+#FOR PHYLA
+  pivot_longer(cols = -phylum,names_to="Sample",values_to="count") %>%
+  group_by(phylum, Sample) %>%
+#FOR FAMILY
+  #pivot_longer(cols = -family,names_to="Sample",values_to="count") %>%
+  #group_by(family, Sample) %>%
+  dplyr::summarize(counts=sum(count)) %>%
+  ungroup()                          
+
+micro_dat <- microdat1 %>%
+  pivot_wider(names_from = "Sample",values_from="counts")
+
+#micro_dat %>%
+   #filter(!is.na(genus)) %>%
+  #filter( phylum != "NA")
+  
+head(micro_dat)
+```
+
+
+## Initial Statistics
+
+Let's calculate alpha diversity first. 
+
+```{r calculate alpha abundances }
+head(meta_dat)
+# transpose
+t_micro <- transpose(micro_dat)
+
+# get row and colnames in order
+rownames(t_micro) <- colnames(micro_dat)
+t_micro <- t_micro %>% row_to_names(row_number = 1)
+
+### now that the data is in the right format (samples as rows, taxa as columns)
+### we want to double check a few of the quality control measures
+#remove duplicate columns
+#dupcol <- which(duplicated(names(t_micro)))
+#dupname <- colnames(t_micro)[dupcol]
+#dupcols <- which(names(t_micro)==dupname)
+#head(t_micro[,dupcols]) ## which taxa are dups
+## resolved with the pivot_wider and pivot_longer above
+       
+# first, we want to remove taxa with fewer than 60 reads
+t_micro[t_micro<5]=0
+# now remove columns (taxa) that have zero observations after this QC step
+ 
+df <- micro_dat > 5
+head(df)
+str(df)
+apply(df, 2, sum)
+str(apply(micro_dat > 40, 2, sum)[2:ncol(micro_dat)])
+
+#column alignment check
+#data_alphadiv$samp == names(apply(micro_dat > 5, 2, sum)[2:ncol(micro_dat)])
+
+
+
+# second, we want to remove taxa that are detected in fewer than 3 samples
+t_micro  %>% select_if(~any(. <=3 ))
+
+t_micro  %>% select_if(~any(. >=3 ))
+otu_pres = which(colSums(t_micro>0)>=3)
+t_micro = t_micro[,otu_pres]
+
+## previously alpha diversity wax calculated with phyloseq, but im phasing that out because it is not actively maintained 
+motu <- t_micro[order(rownames(t_micro)),]
+#motu <- motu %>% select(-sample)
+motu <- data.matrix(motu)
+rownames(motu) <- t_micro$sample
+str(t_micro)
+#motu#motu ## taxa are columns, samples are row
+  
+  
+data_richness <- motu%>% estimateR()  # calculate richness and Chao1 using vegan package ## this one required count data, so only run if using counts
+data_richness
+
+
+data_evenness <- as.numeric( diversity(motu) / log(specnumber(motu)) ) # calculate evenness index using vegan package
+data_shannon <- as.numeric( diversity(motu, index = "shannon") )       # calculate Shannon index using vegan package
+data_alphadiv <- as.data.frame(cbind(data_shannon, data_evenness, rownames(t_micro))) # combine all indices in one data table
+colnames(data_alphadiv) <- c("shannon", "evenness", "samp")
+data_alphadiv <- merge(data_alphadiv, meta_dat, by.x = "samp", by.y = "Sample.ID.1" )
+data_alphadiv [is.na(data_alphadiv )] <- 0
+data_alphadiv$evenness <- as.numeric(data_alphadiv$evenness)
+data_alphadiv$shannon <- as.numeric(data_alphadiv$shannon)
+data_alphadiv$specnum <- apply(micro_dat > 60, 2, sum)[2:ncol(micro_dat)]
+## remove dat for simplicity and space in r
+rm(data_evenness, data_shannon, data_richness)               # remove the unnecessary data/vector
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+library(psych) ## here because it masks some packages in phyloseq
+describe(data_alphadiv$evenness)
+describe(data_alphadiv$shannon)
+describe(data_alphadiv$specnum)
+
+data_alphadiv %>% 
+  filter(shannon != 0) %>%
+  #ggplot(aes( y = shannon, x = plant_type)) +
+#PLANT TYPE
+  ggplot(aes( y = shannon, x = factor(plant_type, level = c("Maize", "Bean", "Squash", "Maize-Squash", "Maize-Bean", "Bean-Squash", "Milpa")))) +
+  geom_boxplot(aes(fill = plant_type, alpha = 0.5)) +
+#MONO vs INTERCROP
+  #ggplot(aes( y = shannon, x = factor(farm_type, level = c("Intercrop", "Monoculture")))) +
+  #geom_boxplot(aes(fill = farm_type, alpha = 0.5)) +
+  geom_point() +
+  theme_minimal() +
+  labs(title = "16S rRNA", x = "Plant Type", y = "Shannon Index") + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=0.5))
+
+data_alphadiv %>% 
+  filter(evenness != 0) %>%
+  #ggplot(aes( y = evenness, x = plant_type)) +
+#PLANT TYPE
+  ggplot(aes( y = evenness, x = factor(plant_type, level = c("Maize", "Bean", "Squash", "Maize-Squash", "Maize-Bean", "Bean-Squash", "Milpa")))) +
+  geom_boxplot(aes( fill = plant_type, alpha = 0.5) ) +
+#MONO vs INTERCROP
+  #ggplot(aes( y = evenness, x = factor(farm_type, level = c("Intercrop", "Monoculture")))) +
+  #geom_boxplot(aes( fill = farm_type, alpha = 0.5) ) +
+  geom_point() +
+  theme_minimal() +
+  labs(title = " ", x = "Plant Type", y = "Evenness") + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=0.5))
+
+#OBSERVED SPECIES  -- Idk what to make y, I tried specnumber and t_micro but im unsure of what might give a plot comparing the number of observed taxa among each plant type (see lines 182 and 227 also)
+data_alphadiv %>% 
+  filter(specnum != 0) %>%
+  ggplot(aes( y = specnum, x = factor(plant_type, level = c("Maize", "Bean", "Squash", "Maize-Squash", "Maize-Bean", "Bean-Squash", "Milpa")))) +
+  geom_boxplot(aes(fill = plant_type, alpha = 0.5)) +
+  geom_point() +
+  theme_minimal() +
+  labs(title = "Observed Species", x = "Plant Type") + 
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=0.5))
+
+print("note that this is calculated with counts data!! Also pay attention to the Y axis - small differences may look big.")
+
+## test for significant differences between alpha diversity and variables
+## make timepoint here a column with samples in the same row order as inpput to data_shan etc
+
+# write loop to run for all meta data variables
+#alphadiv <- merge(data_alphadiv, meta_dat, by.x = "samp", by.y = "Sample.ID.1")
+
+#summary(aov(shannon ~ Season, data = alphadiv)) ## currently doesnt work because only one value "Winter" in "season" column
+#summary(aov(evenness ~ Location, data = alphadiv)) 
+
+summary(aov(evenness ~ plant_type, data = data_alphadiv)) 
+summary(aov(shannon ~ plant_type, data = data_alphadiv))
+#summary(aov(evenness ~ farm_type, data = data_alphadiv)) 
+#summary(aov(shannon ~ farm_type, data = data_alphadiv))
+##summary(aov(specnum ~ plant_type, data = data_alphadiv)) 
+```
+If you get the error "error in evaluating the argument 'object' in selecting a method for function 'summary': contrasts can be applied only to factors with two or more levels", it means you are trying to feed in a variable with only value. For example, in this case, the only value in the "Season" column is "Winter", so we can't run an anova. I'm keeping the math here anyway because this is pretty preliminary stats and good for future work .
+
+Next, we want to convert these counts to relative abundances. 
+
+```{r counts to relative abundance}
+microdat1 <- microdat1 %>% ungroup () %>%
+  group_by(Sample) %>%
+  mutate(rel_abun = round( (counts / sum(counts)) * 100, 5) ) ## add rel abun column
+
+
+## plot the relative abundances
+## note that this will require a lot of playing around to make it look good, and you likely want to do this at a higher taxonomic grouping and not species as displayed here
+library(forcats)
+#** ordering sample or adding plant type column**
+
+microdat1$phylum[microdat1$rel_abun<2] <- "< 2% abund."
+all_bact_phy <- rbind(microdat1)
+
+all_phycols <- length(unique(all_bact_phy$phylum))
+#all_phycols <- length(unique(all_bact_phy$genus))
+all_phycols #32
+all_micropalphy <- colorRampPalette(brewer.pal(12, "Set3"))(all_phycols)
+
+microdat1 %>%
+#FOR SPECIES
+  #ggplot(aes(x = factor(Sample, level = c("1.M", "2.M", "3.M", "1.S", "2.S", "3.S", "1.B", "2.B", "3.B", "1.MS", "2.MS", "3.MS", "1.MB", "2.MB", "3.MB", "1.BS", "2.BS", "3.BS", "1.MSB", "3.MSB")), y = rel_abun, fill = species)) +
+#FOR GENUS
+  #ggplot(aes(x = factor(Sample, level = c("1.M", "2.M", "3.M", "1.S", "2.S", "3.S", "1.B", "2.B", "3.B", "1.MS", "2.MS", "3.MS", "1.MB", "2.MB", "3.MB", "1.BS", "2.BS", "3.BS", "1.MSB", "3.MSB")), y = rel_abun, fill = genus)) +
+#FOR PHYLUM
+  ggplot(aes(x = factor(Sample, level = c("1.M", "2.M", "3.M", "1.S", "2.S", "3.S", "1.B", "2.B", "3.B", "1.MS", "2.MS", "3.MS", "1.MB", "2.MB", "3.MB", "1.BS", "2.BS", "3.BS", "1.MSB", "3.MSB")), y = rel_abun, fill = phylum)) +
+#FOR FAMILY
+  #ggplot(aes(x = factor(Sample, level = c("1.M", "2.M", "3.M", "1.S", "2.S", "3.S", "1.B", "2.B", "3.B", "1.MS", "2.MS", "3.MS", "1.MB", "2.MB", "3.MB", "1.BS", "2.BS", "3.BS", "1.MSB", "3.MSB")), y = rel_abun, fill = family)) +
+  geom_col() +
+  theme(legend.title = element_text(size = 12), legend.text = element_text(size = 10), axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=1), legend.key.size = unit(3,"mm")) + 
+  labs(title = "16S rRNA",
+       x = "", 
+       y = "Relative Abundance")
+
+microdat1
+
+summary(aov(rel_abun ~ Sample, data = all_bact_phy)) 
+#summary(aov(rel_abun ~ farm_type, data = all_bact_phy))
+```
+Here, this bar chart is pretty meaningless - it's almost impossible to represent this at the species level. However we can see that everything adds up to just around 100, which means the math is correct. So it's a good sanity check, and you can play with meaningul plotting at other heirarchical levels. 
+
+## Distance-Based Analysis
+
+So in the OG script, this was coded using phyloseq, however it is not actively maintained so I am phasing it out of this analysis. Meaning I need to recode this whole portion. Woo! 
+
+Anyway, Bray-Curtis is a good distance measure for microbiome data because 1) it is sensitive to values close to zero, 2)it tells you how similar your observed values are to expected values, 3) it is unaffected by the addition or removal of species (as we know all species will not be in all samples). It does assume community samples are the same size (which is true with relative abundance) so we meet those assumptions. 
+
+```{r bray curtis distance tp pca}
+library(vegan) ## im using vegan because it seems more widely used and produces the same math as far as I can tell compared to ecodist::bcdist
+
+## first we need to make our data a matrix-format! I want samples to be rows, taxa to be columns
+datwide1 <- microdat1 %>%
+  #select(Sample, species, rel_abun) %>%
+  #pivot_wider(names_from = species, values_from = rel_abun)
+#GENUS
+  select(Sample, genus, rel_abun) %>%
+  pivot_wider(names_from = genus, values_from = rel_abun)
+#PHYLUM
+  #select(Sample, phylum, rel_abun) %>%
+  #pivot_wider(names_from = phylum, values_from = rel_abun)
+#FAMILY
+  #select(Sample, family, rel_abun) %>%
+  #pivot_wider(names_from = family, values_from = rel_abun)
+
+samprows <- datwide1$Sample
+datwide <- datwide1 %>% ungroup %>% select(-Sample)
+datmat <- as.matrix(datwide)
+rownames(datmat) <- samprows
+
+braydat <- vegdist(datmat, method = "bray")
+pcoa <- cmdscale(braydat, eig=TRUE, add=TRUE)
+
+library(glue)
+positions <- pcoa$points
+colnames(positions) <- c("pcoa1", "pcoa2")
+percent_explained <- 100 * pcoa$eig / sum(pcoa$eig)
+pretty_pe <- format(round(percent_explained, digits =1), nsmall=1, trim=TRUE)
+
+labels <- c(glue("PCo Axis 1 ({pretty_pe[1]}%)"),
+            glue("PCo Axis 2 ({pretty_pe[2]}%)"))
+
+positions %>%
+  as_tibble(rownames = "samples") %>%
+  ggplot(aes(x=pcoa1, y=pcoa2)) +
+  geom_point() +
+  labs(x=labels[1], y=labels[2])
+
+tibble(pe = cumsum(percent_explained),
+       axis = 1:length(percent_explained)) %>%
+  ggplot(aes(x=axis, y=pe)) +
+  geom_line() +
+  coord_cartesian(xlim = c(1, 10), ylim=c(0, 50)) +
+  scale_x_continuous(breaks=1:10)
+
+
+```
+Now instead of looking at the PCA between sample distances (bray curtis distance), lets look at PCA directly with relative abundance. The math is kind of complicated on the differences so I'd run both and see if you have important differences between the two. To read more about ecological distances and R code, check out (this github repo)[https://github.com/riffomonas/distances/tree/f447e005160146f97210a4a05644566ded7cd879].
+
+
+```{r PCA with rel abun scaled data}
+datwide1 %>% ungroup %>%
+  select(-Sample) %>%    # remove Species column
+  scale() %>%            # scale to 0 mean and unit variance
+  prcomp() ->            # do PCA
+  pca                    # store result as `pca`
+
+# now display the results from the PCA analysis
+pca
+
+## examine PCA components 
+head(pca$x)
+
+# add sampleinformation back into PCA data
+pca_data <- data.frame(pca$x, Sample = datwide1$Sample)
+pca_data <- merge(pca_data, meta_dat, by.x = "Sample", by.y = "Sample.ID.1")
+
+head(pca_data)
+
+# plotting settings
+theme_set(theme_bw(base_size=12)) # set default ggplot2 theme
+library(egg) # required to arrange plots side-by-side
+library(grid) # required to draw arrows
+library(ggthemes) # for colorblind color scale
+
+ggplot(pca_data, aes(x = PC1, y = PC2, color = plant_type)) + 
+#ggplot(pca_data, aes(x = PC1, y = PC2, color = farm_type)) + 
+  geom_point() 
+## you can also look at the rotation matrix
+#head(pca$rotation)
+
+# capture the rotation matrix in a data frame
+rotation_data <- data.frame(
+  pca$rotation, 
+  variable = row.names(pca$rotation)
+)
+
+# define a pleasing arrow style
+arrow_style <- arrow(
+  length = unit(0.05, "inches"),
+  type = "closed"
+)
+
+# now plot, using geom_segment() for arrows and geom_text() for labels
+ggplot(rotation_data) + 
+  geom_segment(aes(xend = PC1, yend = PC2), x = 0, y = 0, arrow = arrow_style) + 
+  geom_text(aes(x = PC1, y = PC2, label = variable), hjust = 0, size = 3, color = "red") + 
+  #geom_text(aes(x = ifelse(PC1>10, PC1, "", y = PC2, label = variable), hjust = 0, size = 3, color = "red")) +
+  #xlim(-1., 1.25) + 
+  #ylim(-1., 1.) +
+              coord_fixed() # fix aspect ratio to 1:1
+
+## we also want to know what percentage of the variance in the data is explained by each of the principle components. 
+percent <- 100*pca$sdev^2 / sum(pca$sdev^2)
+percent
+perc_data <- data.frame(percent = percent, PC = 1:length(percent))
+ggplot(perc_data, aes(x = PC, y = percent)) + 
+  geom_col() + 
+  geom_text(aes(label = round(percent, 2)), size = 3.4, vjust = -0.5) + 
+  ylim(0, 20)
+```
+
+So how do we interpret this?We seem to have two clusters along PC1 of the samples here, and there is a low percentage of the variance explained. Perhaps we can gain insight by going to a higher taxonomic level (e.g. class). 
+
+
+# LDM alternative
+
+First, we want to copy over some of the LDM set up for our new model set up. 
+
+```{r ldm set up }
+set.seed(11062015) # set seed for analysis reproducibility, and obviously this is the date the first minion movie came out so it is the ideal seed
+(seed=sample.int(11062015, size=1))
+## we arlready have datmat which is the datamatrix that we want with samples as rows and taxa as columns
+## for metadata, character columns should be factors
+meta_dat[sapply(meta_dat, is.character)] <- lapply(meta_dat[sapply(meta_dat, is.character)], as.factor)
+
+str(meta_dat) ## it worked!
+### order of metadata needs to be the same as the order of the datamatrix 
+#df <- df[order(df$x),]
+meta_dat <- meta_dat[order( rownames(meta_dat) ),]
+meta_dat <- as.data.frame(meta_dat) ## formerly a tibble, must be dataframe for ldm
+
+# check if any duplicate rows
+table(duplicated(meta_dat))
+table(duplicated(datmat))
+#table(rownames(datmat))
+meta_dat <- meta_dat %>% select(-Sample.ID.2)
+rownames(meta_dat) <- meta_dat$Sample.ID.1
+
+rownames(datmat)
+rownames(meta_dat)
+## rando column to meta dat
+#meta_dat$random1 <- sample(100, size = nrow(meta_dat), replace = TRUE)
+#meta_dat$random2 <- sample(100, size = nrow(meta_dat), replace = TRUE)
+
+
+```
+
+The LDM analysis didn't work for drake's data for some reason, so here is an alternative analysis approach. While I like the methods (provided here)[https://microbiome.github.io/tutorials/], I don't like that this is built off of phyloseq because this is an outdated, no longer maintained package. Lets do something that doesn't require it then. One approach is to use DESeq2, which was built for RNA-seq data. I don't love this approach because it requires the user to use pseudo-counts, and I think doing this makes us take a step away from the biological truth. It also becomes a bit harder to understand how your data is biased. I like ANCOM-BC, but it requires absolute abundances (again, counts) which we don't have so I won't be doing that. 
+
+I will try (DMM explained here)[https://microbiome.github.io/tutorials/DMM.html]. 
+
+# DMM
+
+## Dirichlet Multinomial Mixtures
+
+"Dirichlet Multinomial Mixtures (DMM) (Quince et al. 2012) is a probabilistic method for community typing (or clustering) of microbial community profiling data. It is an infinite mixture model, which means that the method can infer the optimal number of community types. Note that the number of community types is likely to grow with data size."
+
+```{r dmm set up}
+library(DirichletMultinomial)
+library(reshape2)
+library(magrittr)
+library(dplyr)
+
+head(datmat)
+str(datmat)
+```
+Run the DMM model. Don't rerun this one a lot because it takes time. 
+
+```{r dmm model}
+fit_dmm <- lapply(1:6, dmn, count = datmat, verbose=TRUE)
+```
+
+Check the model. 
+```{r dmm model check}
+lplc <- base::sapply(fit_dmm, DirichletMultinomial::laplace) # AIC / BIC / Laplace
+aic  <- base::sapply(fit_dmm, DirichletMultinomial::AIC) # AIC / BIC / Laplace
+bic  <- base::sapply(fit_dmm, DirichletMultinomial::BIC) # AIC / BIC / Laplace
+plot(lplc, type="b", xlab="Number of Dirichlet Components", ylab="Model Fit")
+lines(aic, type="b", lty = 2)
+lines(bic, type="b", lty = 3)
+```
+Next, plot of Contribution of each taxonomic group to each component
+Note the number of plots is the number of contributions / community types detected. think of this similar to PCA. You can read the dmm help file for more help and information. 
+
+
+```{r dmm }
+best <- fit_dmm[[which.min(unlist(lplc))]] ## pick best model
+mixturewt(best) ## add pi and beta to model
+assi <- apply(mixture(best), 1, which.max) ## assign sample components
+
+## show biggest contributors (taxa) per group
+for (k in seq(ncol(fitted(best)))) {
+  d <- melt(fitted(best))
+  colnames(d) <- c("OTU", "cluster", "value")
+  d <- subset(d, cluster == k) %>%
+     # Arrange OTUs by assignment strength
+     arrange(value) %>%
+     mutate(OTU = factor(OTU, levels = unique(OTU))) %>%
+     # Only show the most important drivers
+     filter(abs(value) > quantile(abs(value), 0.9))     
+     #Remove NA for scale
+  #filter( OTU != "NA")
+  
+  p <- ggplot(d, aes(x = OTU, y = value)) +
+       geom_bar(stat = "identity") +
+       coord_flip() +
+       labs(title = paste("Top drivers: community type", k))
+  print(p)
+}
+
+```
+Here it looks like bacillus is contributing the most to the community diversity in your samples here with only one community type identified. 
+
+## Investigate significance of community composition. Here, we meet the assumptions if there is no significant difference in bray-curtis distance between groups (here, plant type). 
+
+```{r check permanova assumptions}
+dist <- vegdist(datmat)
+anova(betadisper(dist, meta_dat$farm_type))
+#?vegdist
+```
+Run the permanova.
+```{r run permanova}
+# samples x species as input
+permanova <- adonis2(datmat ~ farm_type,
+               data = meta_dat, permutations=999, method = "bray")
+
+# P-value
+permanova
+
+#fdrtool::fdrtool(c(0.01, 0.05, 0.5), statistic="pvalue")
+
+```
+Here, using PERMANOVA, we see there is no significant association between the microbiome of our samples and plant type. 
+
+If there was a significant P value, you could run the following code to look at the taxa that contribute to that the most:
+```{r}
+coef <- coefficients(permanova)["group1",]
+top.coef <- coef[rev(order(abs(coef)))[1:6]]
+par(mar = c(3, 14, 2, 1))
+barplot(sort(top.coef), horiz = T, las = 1, main = "Top taxa")
+```
+
+
+
+
+
+
+
+## Set up for LDM
+
+To read a benchmarking paper comparing differential modelling methods in microbiome data, (look here)[https://www.biorxiv.org/content/10.1101/2022.07.22.501190v1.full]. To read the OG manuscript introducing LDM, (look here)[https://microbiomejournal.biomedcentral.com/articles/10.1186/s40168-021-01034-9].
+
+*What is LDM?*
+
+"The LDM models microbial abundance in the form of counts transformed into relative abundances as an outcome of interest given experimental covariates of interest. LDM provides users with both global and local hypothesis tests of differential abundance given covariates of interest and microbial count data. LDM decomposes the model sum of squares into parts explained by each variable in the model. From these sub-models we can see the amount of variability that each variable is contributing to the overall variability explained by the model’s covariates of interest... LDM can handle covariates both categorical and continuous and can control for confounders." 
+
+- (source)[https://rpubs.com/jrandall7/EICC16s]
+
+
+"Next, to remove any statistical noise we may still have to detect relationships between the covariates and microbial composition, we decide to keep only those taxa which appear in at least 2 samples. This is a parameter that will vary by project." (e.g. 3 samples for Erika!)
+
+* Do we want to do this with this data? I am inclined to say no, but here is the code in case we want it later: `otu_pres = which(colSums(asvt>0)>=1)` then `asvt = asvt[,otu_pres]` for dat_otu in its current form instead of asvt. 
+
+* "The OTU table should have rows corresponding to samples and columns corresponding to
+OTUs (ldm will transpose the OTU table if the number of rows is not equal to the length of the covariates in the metadata but this consistency check will fail in the unlikely case that the number of OTUs and samples are equal)"
+
+
+
+
+
+Now that we've set up the data and checked the assumptions (required of users), we can run the LDM and make our formulas. Note that a matched LDM is used for variables that change (like timepoints)  while cluster LDMs are used for variables that are consistent across samples but with a grouping variable (like multiple body sites from the same person, or multiple samples from the same type of plant). You are responsible for making sure you select the correct math / form of LDM to use. Read more from (LDM here)[https://github.com/yijuanhu/LDM/blob/master/LDM_vignette_v6.0.pdf].
+
+
+
+```{r most basic ldm, probably not what you want}
+# format: formula_variable <- taxa_datamatrix | (confounders) ~ covariates 
+#rownames(datmat) <- NULL
+#rownames(meta_dat) <- NULL
+formula_ldm <- datmat   ~ plant_type 
+
+fit.ldm <-ldm(formula=formula_ldm, 
+                      data=meta_dat,
+                      dist.method="bray", 
+                      n.perm.max=0,
+              )
+## DRAKE: you get the error  about duplicate row names becaudse there were two sample ID cols in meta dat
+
+
+#fit.ldm
+fit.ldm$VE.global.freq.submodels
+fit.ldm$VE.otu.freq.submodels[1:3] ##contributions of top 3 taxa to VE for submodel 1
+fit.ldm$F.global.freq # F statistics for VE of submodels 1 and 2 (i.e., cov1 and cov2)
+#fit.ldm$F.otu.freq[1,1:3] # F statistics for contribution of OTUs 1-3 in submodels 1 and 2
+### arcsin-root transformed scale
+fit.ldm$VE.global.tran.submodels # VE for submodels 1 and 2
+
+scree.freq<-c(fit.ldm$VE.global.freq.submodels/fit.ldm$VE.df.submodels,fit.ldm$VE.global.freq.residuals)
+plot(scree.freq/sum(scree.freq), main="Frequency Scale",
+xlab="Component", ylab="Proportion of total sum of squares")
+scree.tran<-c(fit.ldm$VE.global.tran.submodels/fit.ldm$VE.df.submodels,fit.ldm$VE.global.tran.residuals)
+plot(scree.tran/sum(scree.tran), main="Arcsin-Root Scale",
+xlab="Component", ylab="")
+
+table(meta_dat$plant_type)
+```
+## Testing relative-abundance associations using ldm and permanovaFL
+
+Now we can run and LDM that leverages the strengths of LDM, such as testing for the significant effects of any taxa with our formula of covariates. Now that we are running the real deal, this will take awhile to process. Running the above LDM is quick so it helps us make sure we can run through without issues, which is very useful in a time-shortened workshop. 
+
+```{r better ldm for drake}
+fit.ldm.2 <-ldm(formula=formula_ldm, 
+                      data=meta_dat,
+                cluster.id = "plant_type", seed=11062015, 
+                perm.within.type="free", perm.between.type="none") # matched sets 
+
+fit.ldm.2$n.perm.completed ## number of permutations that were run 
+fit.ldm.2$global.tests.stopped ## confirm the tests ran to completion
+fit.ldm.2$otu.tests.stopped ## confirm the taxa-level test ran to completion
+fit.ldm.2$p.global.omni ## p values for the outcome variables in same order as the 
+fit.ldm.2$detected.otu.omni ## p values of significant taxa that are associated with each of the outcomes variables
+
+
+```
+
+Let's pull out some of the valuable LDM data.
+
+```{r ldm output processing}
+# we provide a summary table for the detected OTUs (or OTUs with the top smallest p-values), which includes the raw p-value, adjusted p-value (by the Benjamini-Hochberg [1995] [BH] procedure), population-level mean relative abundance, directions of covariate effects, and OTU name (can be substituted by taxonomy assignment); the OTUs are ordered by the raw p-values:
+
+### look at significant OTUs
+raw.pvalue=as.data.frame(signif(fit.ldm.2$p.otu.omni,3))
+raw.pvalue <- cbind(covariate = c( "Management"), raw.pvalue)
+raw.pvalue$species <- rownames(raw.pvalue)
+raw.pvalue$raw_p_value <- raw.pvalue$`signif(fit.ldm.2$p.otu.omni, 3)`
+#raw.pvalue
+########################
+adj.pvalue=as.data.frame(signif(fit.ldm.2$q.otu.omni,3))
+adj.pvalue <- cbind(covariate = c("Management"), adj.pvalue)
+adj.pvalue$species <- rownames(adj.pvalue)
+adj.pvalue$adj_p_value <- adj.pvalue$`signif(fit.ldm.2$q.otu.omni, 3)`
+
+## merge
+sig_otu_ldm <- full_join(raw.pvalue, adj.pvalue, by = c("species", "covariate"))
+options(scipen = 50)
+only_sig_otu <- sig_otu_ldm %>%
+  filter(adj_p_value < 0.05)
+
+#head(dat_otu)
+tidy_otu <- datwide1 %>%
+  pivot_longer(!Sample,
+               names_to = "species",
+               values_to = "rel_abun") %>%
+  filter(rel_abun > 0) 
+tidy_otu$species <- as.factor(tidy_otu$species)
+#write.csv(tidy_otu,"tidy_o-     
+taxa_counts <- tidy_otu %>% dplyr::count(species)
+taxa_counts$number_times_occur <- taxa_counts$n
+taxa_counts <- taxa_counts %>% select(-n)
+taxa_counts
+## merge 
+only_sig_otu <- left_join(only_sig_otu, taxa_counts, by = 'species')
+only_sig_otu
+#spec_counts
+
+#spec_counts_vag_clust # Gammapapillomavirus_6
+write.csv(only_sig_otu, file = "significant_otus_ldm.csv")
+
+```
+
